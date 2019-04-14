@@ -1,28 +1,126 @@
 package releaser
 
 import (
-	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/coreos/go-semver/semver"
 )
 
 type Releaser struct {
-	Client *http.Client
+	*Client
+
+	cache    bool
+	cacheMap map[string]interface{}
 
 	owner string
 	repo  string
+
+	m sync.Mutex
 }
 
-func New(owner, repo string) *Releaser {
-	return &Releaser{
-		Client: http.DefaultClient,
-		owner:  owner,
-		repo:   repo,
+func WithCache() func(*Releaser) {
+	return func(r *Releaser) {
+		r.cache = true
 	}
+}
+
+func WithRepo(s string) func(*Releaser) {
+	return func(r *Releaser) {
+		r.repo = s
+	}
+}
+
+func WithOwner(s string) func(*Releaser) {
+	return func(r *Releaser) {
+		r.owner = s
+	}
+}
+
+func New(options ...func(*Releaser)) (*Releaser, error) {
+	client, _ := newClient()
+
+	r := &Releaser{
+		Client:   client,
+		cacheMap: map[string]interface{}{},
+	}
+
+	for _, fn := range options {
+		fn(r)
+	}
+
+	if r.owner == "" {
+		return nil, fmt.Errorf("Owner not set")
+	}
+
+	if r.repo == "" {
+		return nil, fmt.Errorf("Repo not set")
+	}
+
+	return r, nil
+}
+
+func SinceCommit(hash string) func(Commit) bool {
+	found := false
+	return func(c Commit) bool {
+		if c.Sha == hash {
+			found = true
+			return true
+		} else if strings.HasPrefix(c.Sha, hash) {
+			found = true
+			return true
+		} else if found {
+			return true
+		}
+
+		return false
+	}
+}
+
+func (u *Releaser) Commits(filterOpts ...func(Commit) bool) ([]Commit, error) {
+	u.m.Lock()
+	defer u.m.Unlock()
+
+	path := fmt.Sprintf("/repos/%s/%s/commits", u.owner, u.repo)
+
+	commits := []Commit{}
+
+	if !u.cache {
+		// check in cache
+	} else if val, ok := u.cacheMap[path]; ok {
+		commits = val.([]Commit)
+	}
+
+	if len(commits) == 0 {
+		req, err := u.NewRequest(http.MethodGet, path, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := u.Do(req, &commits); err != nil {
+			return nil, fmt.Errorf("Could not check for update: %s", err.Error())
+		}
+
+		u.cacheMap[path] = commits
+	}
+
+	rCommits := []Commit{}
+	for _, commit := range commits {
+		filtered := false
+		for _, fn := range filterOpts {
+			filtered = filtered || fn(commit)
+		}
+
+		if filtered {
+			continue
+		}
+
+		rCommits = append(rCommits, commit)
+	}
+
+	return rCommits, nil
 }
 
 func (u *Releaser) Available(version string) (*Release, error) {
@@ -31,22 +129,14 @@ func (u *Releaser) Available(version string) (*Release, error) {
 		return nil, err
 	}
 
-	resp, err := u.Client.Get(fmt.Sprintf("https://api.github.com/repos/%s/%s/releases", u.owner, u.repo))
+	req, err := u.NewRequest(http.MethodGet, fmt.Sprintf("/repos/%s/%s/releases", u.owner, u.repo), nil)
 	if err != nil {
 		return nil, err
 	}
 
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		fmt.Println(resp.StatusCode)
-		return nil, errors.New("Could not check for update")
-	}
-
 	releases := []Release{}
-
-	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
-		return nil, err
+	if err := u.Do(req, &releases); err != nil {
+		return nil, fmt.Errorf("Could not check for update: %s", err.Error())
 	}
 
 	if len(releases) == 0 {
